@@ -16,7 +16,7 @@ import inspect
 import json
 from pathlib import Path
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults, ToolDenied
 from pydantic_ai.exceptions import ModelHTTPError
 from fastmcp import Client
 from pydantic_ai.mcp import MCPToolset, StdioTransport
@@ -38,10 +38,11 @@ INSTRUCTIONS = """\
 """
 
 # モデルは実行時に渡す（テストではAPIを呼ばない TestModel に差し替えるため）
-agent = Agent(instructions=INSTRUCTIONS)
+agent = Agent(instructions=INSTRUCTIONS, output_type=[str, DeferredToolRequests])
 agent.tool_plain(tools.search_glossary)
 agent.tool_plain(tools.get_lecture_summary)
 agent.tool_plain(tools.make_quiz)
+agent.tool_plain(tools.save_learning_log, requires_approval=True)
 
 # TODO(第3回 演習): tools.py に make_quiz を作り、ここで登録しよう
 
@@ -128,8 +129,26 @@ def main() -> None:
     print(f"[model] {MODEL}")
     if args.mcp:
         print("[tools] MCP サーバー（app/mcp_servers.json）")
+    model = build_model()
     try:
-        result = target.run_sync(args.question, model=build_model())
+        result = target.run_sync(args.question, model=model)
+        while isinstance(result.output, DeferredToolRequests):
+            results = DeferredToolResults()
+            for call in result.output.approvals:
+                print(f"\n[承認待ち] {call.tool_name}({call.args})")
+                ok = input("実行してよいですか？ [y/N] ").strip().lower() == "y"
+                if ok:
+                    # y が押されたら「許可（True）」を記録
+                    results.approvals[call.tool_call_id] = True
+                else:
+                    # それ以外なら「拒否（ToolDenied）」を記録
+                    results.approvals[call.tool_call_id] = ToolDenied("利用者が保存を断りました。")
+            # 3. これまでの会話履歴（message_history）と承認結果を渡して、停止した場所から再開！
+            result = target.run_sync(
+                message_history=result.all_messages(),
+                deferred_tool_results=results,
+                model=model,
+            )
     except ModelHTTPError as e:
         print(api_error_message(e.status_code, str(e.body)[:200]))
         raise SystemExit(1)
